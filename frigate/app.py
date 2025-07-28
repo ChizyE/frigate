@@ -16,6 +16,7 @@ from playhouse.sqlite_ext import SqliteExtDatabase
 import frigate.util as util
 from frigate.api.auth import hash_password
 from frigate.api.fastapi_app import create_fastapi_app
+from frigate.config import CameraConfig
 from frigate.camera import CameraMetrics, PTZMetrics
 from frigate.comms.base_communicator import Communicator
 from frigate.comms.config_updater import ConfigPublisher
@@ -673,6 +674,7 @@ class FrigateApp:
                     self.onvif_controller,
                     self.stats_emitter,
                     self.event_metadata_updater,
+                    self,
                 ),
                 host="127.0.0.1",
                 port=5001,
@@ -768,3 +770,69 @@ class FrigateApp:
             shm.unlink()
 
         os._exit(os.EX_OK)
+
+    def add_camera(self, camera_config: CameraConfig) -> None:
+        """Dynamically add a camera and start associated processes."""
+        camera_config.create_ffmpeg_cmds()
+        name = camera_config.name
+
+        if not name:
+            logger.error("Camera config must include a name")
+            return
+
+        if name in self.config.cameras:
+            logger.error(f"Camera {name} already exists")
+            return
+
+        self.config.cameras[name] = camera_config
+
+        # initialize metrics and helpers
+        self.camera_metrics[name] = CameraMetrics()
+        self.ptz_metrics[name] = PTZMetrics(
+            autotracker_enabled=camera_config.onvif.autotracking.enabled
+        )
+        self.region_grids[name] = get_camera_regions_grid(
+            name,
+            camera_config.detect,
+            max(self.config.model.width, self.config.model.height),
+        )
+        self.detection_out_events[name] = mp.Event()
+
+        shm_frame_count = self.shm_frame_count()
+        for i in range(shm_frame_count):
+            frame_size = (
+                camera_config.frame_shape_yuv[0] * camera_config.frame_shape_yuv[1]
+            )
+            self.frame_manager.create(f"{name}_frame{i}", frame_size)
+
+        capture_process = util.Process(
+            target=capture_camera,
+            name=f"camera_capture:{name}",
+            args=(name, camera_config, shm_frame_count, self.camera_metrics[name]),
+        )
+        capture_process.daemon = True
+        self.camera_metrics[name].capture_process = capture_process
+        capture_process.start()
+
+        camera_process = util.Process(
+            target=track_camera,
+            name=f"camera_processor:{name}",
+            args=(
+                name,
+                camera_config,
+                self.config.model,
+                self.config.model.merged_labelmap,
+                self.detection_queue,
+                self.detection_out_events[name],
+                self.detected_frames_queue,
+                self.camera_metrics[name],
+                self.ptz_metrics[name],
+                self.region_grids[name],
+            ),
+            daemon=True,
+        )
+        self.camera_metrics[name].process = camera_process
+        camera_process.start()
+        logger.info(
+            f"Camera {name} added: capture {capture_process.pid}, processor {camera_process.pid}"
+        )

@@ -27,7 +27,7 @@ from frigate.api.auth import require_role
 from frigate.api.defs.query.app_query_parameters import AppTimelineHourlyQueryParameters
 from frigate.api.defs.request.app_body import AppConfigSetBody
 from frigate.api.defs.tags import Tags
-from frigate.config import FrigateConfig
+from frigate.config import FrigateConfig, CameraConfig
 from frigate.models import Event, Timeline
 from frigate.stats.prometheus import get_metrics, update_metrics
 from frigate.util.builtin import (
@@ -589,6 +589,31 @@ def restart():
         ),
         status_code=200,
     )
+
+
+@router.post("/cameras", dependencies=[Depends(require_role(["admin"]))])
+def add_camera(request: Request, body: dict = Body(...)):
+    """Dynamically add a camera configuration."""
+    try:
+        camera_config = CameraConfig(**body)
+    except ValidationError as e:
+        return JSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=400,
+        )
+
+    if camera_config.name in request.app.frigate_config.cameras:
+        return JSONResponse(
+            content={"success": False, "message": "Camera already exists"},
+            status_code=400,
+        )
+
+    request.app.frigate_config.cameras[camera_config.name] = camera_config
+
+    if getattr(request.app, "frigate_app", None) is not None:
+        request.app.frigate_app.add_camera(camera_config)
+
+    return JSONResponse(content={"success": True}, status_code=200)
 
 
 @router.get("/labels")
